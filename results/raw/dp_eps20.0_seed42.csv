@@ -1,0 +1,7 @@
+experiment,epsilon,delta,seed,round,train_loss,train_accuracy,test_accuracy,num_clients,local_epochs,batch_size,learning_rate,max_grad_norm,noise_multiplier,num_samples,current_epsilon,elapsed_time,dp_enabled
+dp_eps20.0_seed42,20.0,1e-05,42,0,2.298612,0.000000,0.086700,8,1,64,0.01,1.0,,10000,,5.80,True
+dp_eps20.0_seed42,20.0,1e-05,42,1,2.244665,0.000000,0.275000,8,1,64,0.01,1.0,,10000,,97.98,True
+dp_eps20.0_seed42,20.0,1e-05,42,2,2.185480,0.000000,0.417400,8,1,64,0.01,1.0,,10000,,188.71,True
+dp_eps20.0_seed42,20.0,1e-05,42,3,2.096011,0.000000,0.435500,8,1,64,0.01,1.0,,10000,,275.03,True
+dp_eps20.0_seed42,20.0,1e-05,42,4,1.982165,0.000000,0.452700,8,1,64,0.01,1.0,,10000,,365.33,True
+dp_eps20.0_seed42,20.0,1e-05,42,5,1.848274,0.000000,0.465800,8,1,64,0.01,1.0,,10000,,456.08,True
