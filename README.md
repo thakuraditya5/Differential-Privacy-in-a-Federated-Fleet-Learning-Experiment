@@ -72,8 +72,8 @@ Exact version requirements are declared in `pyproject.toml` and `requirements.tx
 ### Setup Virtual Environment
 
 ```bash
-git clone https://github.com/<your-username>/federated-dp-fleet.git
-cd federated-dp-fleet
+git clone https://github.com/thakuraditya5/Differential-Privacy-in-a-Federated-Fleet-Learning-Experiment.git
+cd Differential-Privacy-in-a-Federated-Fleet-Learning-Experiment
 
 python3 -m venv .venv
 source .venv/bin/activate
