@@ -20,9 +20,10 @@ import torch
 import torch.nn as nn
 from flwr.client import NumPyClient
 from numpy.typing import NDArray
+from opacus.accountants import RDPAccountant
 from torch.utils.data import DataLoader
 
-from fleet_dp.dp import attach_privacy_engine, get_privacy_spent
+from fleet_dp.dp import attach_privacy_engine
 from fleet_dp.model import create_model
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class FleetClient(NumPyClient):
         target_delta: float = 1e-5,
         max_grad_norm: float = 1.0,
         noise_multiplier: Optional[float] = None,
+        clipping_only: bool = False,
     ) -> None:
         super().__init__()
         self.client_id = client_id
@@ -73,12 +75,15 @@ class FleetClient(NumPyClient):
         self.target_delta = target_delta
         self.max_grad_norm = max_grad_norm
         self.noise_multiplier = noise_multiplier
+        self.clipping_only = clipping_only
 
         # These are set fresh each round
         self.model: Optional[nn.Module] = None
         self.privacy_engine = None
         self._current_epsilon: Optional[float] = None
-        self._actual_noise_multiplier: Optional[float] = None
+        self._accountant = RDPAccountant()
+        self._accounted_steps = 0
+        self._last_round = 0
 
     def get_parameters(self, config: dict[str, Any]) -> list[NDArray]:
         """Return model parameters as a list of NumPy arrays."""
@@ -124,9 +129,16 @@ class FleetClient(NumPyClient):
         train_loader = self.train_loader
         self.privacy_engine = None
         self._current_epsilon = None
+        round_num = int(config.get("server_round", self._last_round + 1))
+        self._last_round = round_num
+        noise_norms: list[float] = []
+        clipped_grad_norms: list[float] = []
+        preclip_sample_norms: list[float] = []
+        clipped_sample_norms: list[float] = []
 
-        if self.dp_enabled and self.target_epsilon is not None:
-            # Attach Opacus PrivacyEngine for DP-SGD
+        if self.dp_enabled or self.clipping_only:
+            # Opacus handles per-sample clipping for both DP-SGD and the
+            # clipping-only control; the latter uses exactly zero noise.
             self.model, optimizer, train_loader, self.privacy_engine = (
                 attach_privacy_engine(
                     model=self.model,
@@ -136,9 +148,89 @@ class FleetClient(NumPyClient):
                     target_delta=self.target_delta,
                     epochs=self.local_epochs,
                     max_grad_norm=self.max_grad_norm,
-                    noise_multiplier=self.noise_multiplier,
+                    noise_multiplier=(
+                        0.0 if self.clipping_only else self.noise_multiplier
+                    ),
                 )
             )
+            if not self.clipping_only:
+                self.noise_multiplier = float(optimizer.noise_multiplier)
+                sample_rate = getattr(train_loader, "sample_rate", None)
+                if sample_rate is None:
+                    dataset_size = max(len(self.train_loader.dataset), 1)
+                    sample_rate = min(
+                        1.0,
+                        (self.train_loader.batch_size or 1) / dataset_size,
+                    )
+                steps_per_round = len(train_loader) * self.local_epochs
+                expected_prior_steps = max(0, round_num - 1) * steps_per_round
+                while self._accounted_steps < expected_prior_steps:
+                    self._accountant.step(
+                        noise_multiplier=self.noise_multiplier,
+                        sample_rate=sample_rate,
+                    )
+                    self._accounted_steps += 1
+
+            original_clip = optimizer.clip_and_accumulate
+
+            def measure_clipping() -> None:
+                grad_samples = optimizer.grad_samples
+                if grad_samples and len(grad_samples[0]) > 0:
+                    per_parameter_norms = [
+                        grad.reshape(len(grad), -1).norm(2, dim=1)
+                        for grad in grad_samples
+                    ]
+                    sample_norms = torch.stack(
+                        per_parameter_norms, dim=1
+                    ).norm(2, dim=1)
+                    preclip_sample_norms.append(
+                        float(sample_norms.mean().item())
+                    )
+                    clipped_sample_norms.append(
+                        float(
+                            sample_norms.clamp(max=self.max_grad_norm)
+                            .mean()
+                            .item()
+                        )
+                    )
+                original_clip()
+                clipped_grad_norms.append(
+                    float(
+                        torch.sqrt(
+                            sum(
+                                parameter.summed_grad.float().pow(2).sum()
+                                for parameter in optimizer.params
+                            )
+                        ).item()
+                    )
+                )
+
+            optimizer.clip_and_accumulate = measure_clipping
+            original_add_noise = optimizer.add_noise
+
+            def measure_noise() -> None:
+                clipped_grads = [
+                    parameter.summed_grad.detach().clone()
+                    for parameter in optimizer.params
+                ]
+                original_add_noise()
+                noise_norms.append(
+                    float(
+                        torch.sqrt(
+                            sum(
+                                (parameter.grad - clipped_grad)
+                                .float()
+                                .pow(2)
+                                .sum()
+                                for parameter, clipped_grad in zip(
+                                    optimizer.params, clipped_grads
+                                )
+                            )
+                        ).item()
+                    )
+                )
+
+            optimizer.add_noise = measure_noise
 
         # Local training
         self.model.train()
@@ -154,6 +246,13 @@ class FleetClient(NumPyClient):
                 loss = loss_fn(output, target)
                 loss.backward()
                 optimizer.step()
+
+                if self.dp_enabled and self.privacy_engine is not None:
+                    self._accountant.step(
+                        noise_multiplier=self.noise_multiplier,
+                        sample_rate=sample_rate,
+                    )
+                    self._accounted_steps += 1
 
                 total_loss += loss.item() * data.size(0)
                 pred = output.argmax(dim=1, keepdim=True)
@@ -173,24 +272,39 @@ class FleetClient(NumPyClient):
             "num_samples": dataset_size,
             "processed_samples": total,
             "dp_enabled": self.dp_enabled,
+            "clipping_only": self.clipping_only,
+            "server_round": round_num,
         }
 
-        if self.privacy_engine is not None:
-            eps_spent, _ = get_privacy_spent(
-                self.privacy_engine, self.target_delta
+        if clipped_grad_norms:
+            metrics["clipped_grad_norm"] = float(np.mean(clipped_grad_norms))
+            metrics["noise_norm"] = float(np.mean(noise_norms))
+            metrics["preclip_sample_grad_norm"] = float(
+                np.mean(preclip_sample_norms)
             )
-            self._current_epsilon = eps_spent
-            metrics["epsilon_spent"] = float(eps_spent)
-            nm = getattr(optimizer, "noise_multiplier", self._actual_noise_multiplier)
-            if nm is not None:
-                metrics["noise_multiplier"] = float(nm)
-                self._actual_noise_multiplier = float(nm)
+            metrics["clipped_sample_grad_norm"] = float(
+                np.mean(clipped_sample_norms)
+            )
+
+        if self.privacy_engine is not None:
+            if self.dp_enabled:
+                eps_spent = self._accountant.get_epsilon(
+                    delta=self.target_delta
+                )
+                self._current_epsilon = eps_spent
+                metrics["epsilon_spent"] = float(eps_spent)
+            metrics["noise_multiplier"] = float(optimizer.noise_multiplier)
 
         logger.info(
             f"  Vehicle {self.client_id}: loss={avg_loss:.4f}, "
             f"acc={accuracy:.4f}, dataset_samples={dataset_size}"
             + (f", ε_spent={self._current_epsilon:.2f}"
-               if self._current_epsilon else "")
+               if self._current_epsilon is not None else "")
+            + (
+                f", clipped_grad_norm={metrics['clipped_grad_norm']:.4f}, "
+                f"noise_norm={metrics['noise_norm']:.4f}"
+                if "clipped_grad_norm" in metrics else ""
+            )
         )
 
         # Extract parameters from possibly-wrapped model

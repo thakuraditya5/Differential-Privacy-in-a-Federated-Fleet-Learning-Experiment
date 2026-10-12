@@ -5,6 +5,7 @@ dataset:
   num_clients: 8
 device: cpu
 dp:
+  current_epsilon: null
   enabled: false
   max_grad_norm: 1.0
   noise_multiplier: null
@@ -17,7 +18,7 @@ federated:
   fraction_fit: 1.0
   learning_rate: 0.01
   local_epochs: 1
-  num_rounds: 10
+  num_rounds: 20
 model:
   name: mnist_cnn
 output_dir: results

@@ -1,0 +1,37 @@
+{
+  "seed": 44,
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "device": "cpu",
+  "output_dir": "results_robust",
+  "experiment_name": "default",
+  "dataset": {
+    "name": "mnist",
+    "num_clients": 8,
+    "iid": false,
+    "dirichlet_alpha": 0.3
+  },
+  "model": {
+    "name": "mnist_cnn"
+  },
+  "federated": {
+    "num_rounds": 50,
+    "fraction_fit": 1.0,
+    "fraction_evaluate": 1.0,
+    "local_epochs": 3,
+    "batch_size": 64,
+    "learning_rate": 0.05
+  },
+  "dp": {
+    "enabled": false,
+    "clipping_only": false,
+    "target_epsilon": null,
+    "target_delta": 1e-05,
+    "max_grad_norm": 0.5,
+    "noise_multiplier": null,
+    "current_epsilon": null
+  }
+}

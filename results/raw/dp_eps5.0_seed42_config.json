@@ -18,7 +18,7 @@
     "name": "mnist_cnn"
   },
   "federated": {
-    "num_rounds": 5,
+    "num_rounds": 20,
     "fraction_fit": 1.0,
     "fraction_evaluate": 1.0,
     "local_epochs": 1,
@@ -30,6 +30,7 @@
     "target_epsilon": 5.0,
     "target_delta": 1e-05,
     "max_grad_norm": 1.0,
-    "noise_multiplier": null
+    "noise_multiplier": 0.582275390625,
+    "current_epsilon": 5.633116343940466
   }
 }

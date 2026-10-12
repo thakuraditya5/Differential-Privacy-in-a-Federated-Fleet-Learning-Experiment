@@ -27,6 +27,7 @@ class RoundMetrics:
     round_num: int = 0
     train_loss: float = 0.0
     train_accuracy: float = 0.0
+    test_loss: float = 0.0
     test_accuracy: float = 0.0
     num_clients: int = 0
     local_epochs: int = 0
@@ -36,8 +37,13 @@ class RoundMetrics:
     noise_multiplier: Optional[float] = None
     num_samples: int = 0
     current_epsilon: Optional[float] = None
+    clipped_grad_norm: Optional[float] = None
+    noise_norm: Optional[float] = None
+    preclip_sample_grad_norm: Optional[float] = None
+    clipped_sample_grad_norm: Optional[float] = None
     elapsed_time: float = 0.0
     dp_enabled: bool = False
+    clipping_only: bool = False
 
 
 class MetricsCollector:
@@ -45,10 +51,12 @@ class MetricsCollector:
 
     CSV_COLUMNS = [
         "experiment", "epsilon", "delta", "seed", "round",
-        "train_loss", "train_accuracy", "test_accuracy",
+        "train_loss", "train_accuracy", "test_loss", "test_accuracy",
         "num_clients", "local_epochs", "batch_size", "learning_rate",
         "max_grad_norm", "noise_multiplier", "num_samples",
-        "current_epsilon", "elapsed_time", "dp_enabled",
+        "current_epsilon", "clipped_grad_norm", "noise_norm",
+        "preclip_sample_grad_norm", "clipped_sample_grad_norm",
+        "elapsed_time", "dp_enabled", "clipping_only",
     ]
 
     def __init__(self, output_dir: str | Path = "results"):
@@ -115,21 +123,45 @@ class MetricsCollector:
                     "round": r.round_num,
                     "train_loss": f"{r.train_loss:.6f}",
                     "train_accuracy": f"{r.train_accuracy:.6f}",
+                    "test_loss": f"{r.test_loss:.6f}",
                     "test_accuracy": f"{r.test_accuracy:.6f}",
                     "num_clients": r.num_clients,
                     "local_epochs": r.local_epochs,
                     "batch_size": r.batch_size,
                     "learning_rate": r.learning_rate,
-                    "max_grad_norm": r.max_grad_norm if r.max_grad_norm else "",
+                    "max_grad_norm": (
+                        r.max_grad_norm if r.max_grad_norm is not None else ""
+                    ),
                     "noise_multiplier": (
-                        f"{r.noise_multiplier:.6f}" if r.noise_multiplier else ""
+                        f"{r.noise_multiplier:.6f}"
+                        if r.noise_multiplier is not None
+                        else ""
                     ),
                     "num_samples": r.num_samples,
                     "current_epsilon": (
-                        f"{r.current_epsilon:.4f}" if r.current_epsilon else ""
+                        f"{r.current_epsilon:.4f}"
+                        if r.current_epsilon is not None
+                        else ""
+                    ),
+                    "clipped_grad_norm": (
+                        f"{r.clipped_grad_norm:.6f}"
+                        if r.clipped_grad_norm is not None else ""
+                    ),
+                    "noise_norm": (
+                        f"{r.noise_norm:.6f}"
+                        if r.noise_norm is not None else ""
+                    ),
+                    "preclip_sample_grad_norm": (
+                        f"{r.preclip_sample_grad_norm:.6f}"
+                        if r.preclip_sample_grad_norm is not None else ""
+                    ),
+                    "clipped_sample_grad_norm": (
+                        f"{r.clipped_sample_grad_norm:.6f}"
+                        if r.clipped_sample_grad_norm is not None else ""
                     ),
                     "elapsed_time": f"{r.elapsed_time:.2f}",
                     "dp_enabled": r.dp_enabled,
+                    "clipping_only": r.clipping_only,
                 }
                 writer.writerow(row)
 

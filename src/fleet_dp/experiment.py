@@ -43,6 +43,7 @@ def run_epsilon_sweep(
     base_config: ExperimentConfig,
     epsilons: list[Optional[float]],
     seeds: list[int],
+    include_clipping_only: bool = True,
 ) -> list[RoundMetrics]:
     """Run experiments across multiple epsilon values and seeds.
 
@@ -56,8 +57,24 @@ def run_epsilon_sweep(
     """
     all_rounds: list[RoundMetrics] = []
 
+    if include_clipping_only:
+        cfg = base_config.copy()
+        cfg.dp.enabled = False
+        cfg.dp.clipping_only = True
+        cfg.dp.target_epsilon = None
+        cfg.dp.noise_multiplier = None
+        cfg.dp.current_epsilon = None
+        logger.info("\n%s\n# Experiment: clipping-only\n%s", "#" * 60, "#" * 60)
+        for seed in seeds:
+            logger.info("\n--- Clipping-only seed %s ---", seed)
+            rounds = run_single_experiment(cfg, seed)
+            all_rounds.extend(rounds)
+
     for eps in epsilons:
         cfg = base_config.copy()
+        cfg.dp.clipping_only = False
+        cfg.dp.noise_multiplier = None
+        cfg.dp.current_epsilon = None
         if eps is None:
             cfg.dp.enabled = False
             cfg.dp.target_epsilon = None
@@ -110,6 +127,7 @@ def aggregate_results(
             "round": r.round_num,
             "train_loss": r.train_loss,
             "train_accuracy": r.train_accuracy,
+            "test_loss": r.test_loss,
             "test_accuracy": r.test_accuracy,
             "num_clients": r.num_clients,
             "local_epochs": r.local_epochs,
@@ -119,8 +137,13 @@ def aggregate_results(
             "noise_multiplier": r.noise_multiplier,
             "num_samples": r.num_samples,
             "current_epsilon": r.current_epsilon,
+            "clipped_grad_norm": r.clipped_grad_norm,
+            "noise_norm": r.noise_norm,
+            "preclip_sample_grad_norm": r.preclip_sample_grad_norm,
+            "clipped_sample_grad_norm": r.clipped_sample_grad_norm,
             "elapsed_time": r.elapsed_time,
             "dp_enabled": r.dp_enabled,
+            "clipping_only": r.clipping_only,
         })
 
     df = pd.DataFrame(records)
@@ -132,6 +155,7 @@ def run_full_experiment(
     epsilons: Optional[list[Optional[float]]] = None,
     seeds: Optional[list[int]] = None,
     output_dir: str = "results",
+    include_clipping_only: bool = True,
 ) -> pd.DataFrame:
     """Run the full experiment pipeline.
 
@@ -164,7 +188,9 @@ def run_full_experiment(
     logger.info(f"Epsilons: {epsilons}")
     logger.info(f"Seeds: {seeds}")
 
-    all_rounds = run_epsilon_sweep(config, epsilons, seeds)
+    all_rounds = run_epsilon_sweep(
+        config, epsilons, seeds, include_clipping_only=include_clipping_only
+    )
     df = aggregate_results(all_rounds, output_dir)
 
     elapsed = time.time() - start_time

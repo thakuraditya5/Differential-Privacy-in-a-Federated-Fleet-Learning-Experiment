@@ -57,6 +57,8 @@ def plot_accuracy_vs_round(df: pd.DataFrame, output_dir: Path) -> Path:
     # Group by (experiment_type, round) to aggregate across seeds
     # Determine experiment display label
     def get_exp_label(row):
+        if row.get("clipping_only", False):
+            return "Clipping only (no noise)"
         if not row["dp_enabled"] or pd.isna(row["epsilon"]) or row["epsilon"] == "":
             return "No DP (Baseline)"
         return f"DP (ε = {float(row['epsilon']):g})"
@@ -64,7 +66,14 @@ def plot_accuracy_vs_round(df: pd.DataFrame, output_dir: Path) -> Path:
     df["display_label"] = df.apply(get_exp_label, axis=1)
 
     # Order of curves
-    unique_labels = sorted(df["display_label"].unique(), key=lambda x: (0 if "No DP" in x else 1, float(x.split("=")[-1].replace(")", "").strip()) if "ε" in x else 999))
+    unique_labels = sorted(
+        df["display_label"].unique(),
+        key=lambda x: (
+            0 if "No DP" in x else 1 if "Clipping only" in x else 2,
+            float(x.split("=")[-1].replace(")", "").strip())
+            if "ε" in x else 999,
+        ),
+    )
 
     colors = sns.color_palette("tab10", len(unique_labels))
 
@@ -103,8 +112,16 @@ def plot_final_accuracy_vs_epsilon(df: pd.DataFrame, output_dir: Path) -> Path:
     final_df = df[df["round"] == max_round].copy()
 
     # Split into baseline vs DP
-    baseline = final_df[~final_df["dp_enabled"] | final_df["epsilon"].isna() | (final_df["epsilon"] == "")]
-    dp_df = final_df[final_df["dp_enabled"] & final_df["epsilon"].notna() & (final_df["epsilon"] != "")].copy()
+    clipping_only = final_df[final_df.get("clipping_only", False).astype(bool)] if "clipping_only" in final_df else final_df.iloc[0:0]
+    baseline = final_df[
+        ~final_df["dp_enabled"]
+        & ~final_df.get("clipping_only", pd.Series(False, index=final_df.index)).astype(bool)
+    ]
+    dp_df = final_df[
+        final_df["dp_enabled"]
+        & final_df["epsilon"].notna()
+        & (final_df["epsilon"] != "")
+    ].copy()
     dp_df["epsilon"] = dp_df["epsilon"].astype(float)
 
     # Plot baseline as horizontal dashed reference band
@@ -113,6 +130,12 @@ def plot_final_accuracy_vs_epsilon(df: pd.DataFrame, output_dir: Path) -> Path:
         base_std = baseline["test_accuracy"].std() * 100.0 if len(baseline) > 1 else 0.0
         ax.axhline(base_mean, color="red", linestyle="--", linewidth=1.8, label=f"Baseline (No DP): {base_mean:.1f}%")
         ax.axhspan(base_mean - base_std, base_mean + base_std, color="red", alpha=0.12)
+
+    if not clipping_only.empty:
+        clip_mean = clipping_only["test_accuracy"].mean() * 100.0
+        clip_std = clipping_only["test_accuracy"].std() * 100.0 if len(clipping_only) > 1 else 0.0
+        ax.axhline(clip_mean, color="green", linestyle=":", linewidth=1.8, label=f"Clipping only: {clip_mean:.1f}%")
+        ax.axhspan(clip_mean - clip_std, clip_mean + clip_std, color="green", alpha=0.10)
 
     if not dp_df.empty:
         # Group by epsilon
@@ -165,7 +188,10 @@ def plot_accuracy_degradation(df: pd.DataFrame, output_dir: Path) -> Path:
     max_round = df["round"].max()
     final_df = df[df["round"] == max_round].copy()
 
-    baseline = final_df[~final_df["dp_enabled"] | final_df["epsilon"].isna() | (final_df["epsilon"] == "")]
+    baseline = final_df[
+        ~final_df["dp_enabled"]
+        & ~final_df.get("clipping_only", pd.Series(False, index=final_df.index)).astype(bool)
+    ]
     if baseline.empty:
         print("Warning: No baseline found for accuracy degradation plot.")
         return output_dir / "plot3_accuracy_degradation.png"

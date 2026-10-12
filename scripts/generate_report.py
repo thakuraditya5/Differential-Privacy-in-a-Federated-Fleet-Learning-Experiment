@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -34,8 +35,13 @@ def generate_report(results_path: Path, output_path: Path) -> None:
     max_round = df["round"].max()
     final_df = df[df["round"] == max_round].copy()
 
-    # Distinguish baseline from DP
-    baseline = final_df[~final_df["dp_enabled"] | final_df["epsilon"].isna() | (final_df["epsilon"] == "")]
+    # Keep the clipping-only control separate from the true baseline.
+    clipping_flags = df.get(
+        "clipping_only", pd.Series(False, index=df.index)
+    ).astype(bool)
+    final_clipping_flags = clipping_flags.loc[final_df.index]
+    clipping_final = final_df[final_clipping_flags]
+    baseline = final_df[~final_df["dp_enabled"] & ~final_clipping_flags]
     base_mean = baseline["test_accuracy"].mean() * 100.0 if not baseline.empty else float("nan")
     base_std = baseline["test_accuracy"].std() * 100.0 if len(baseline) > 1 else 0.0
 
@@ -53,6 +59,20 @@ def generate_report(results_path: Path, output_path: Path) -> None:
             "accuracy": f"{base_mean:.2f} ± {base_std:.2f}%",
             "drop": "0.00%",
             "mean_acc": base_mean,
+        })
+
+    if not clipping_final.empty:
+        clip_mean = clipping_final["test_accuracy"].mean() * 100.0
+        clip_std = clipping_final["test_accuracy"].std() * 100.0 if len(clipping_final) > 1 else 0.0
+        clip_drop = base_mean - clip_mean if not np.isnan(base_mean) else float("nan")
+        table_rows.append({
+            "config": "Clipping only (no noise)",
+            "epsilon": "N/A",
+            "delta": "N/A",
+            "noise_mult": "0.0000",
+            "accuracy": f"{clip_mean:.2f} ± {clip_std:.2f}%",
+            "drop": f"-{clip_drop:.2f}%" if clip_drop > 0 else f"+{-clip_drop:.2f}%",
+            "mean_acc": clip_mean,
         })
 
     if not dp_df.empty:
@@ -73,9 +93,11 @@ def generate_report(results_path: Path, output_path: Path) -> None:
                 "mean_acc": acc_mean,
             })
 
-    # Sort table rows: Baseline first, then descending epsilon
-    table_rows_sorted = [r for r in table_rows if r["config"].startswith("No DP")] + sorted(
-        [r for r in table_rows if not r["config"].startswith("No DP")],
+    # Sort controls first, then DP conditions by descending epsilon.
+    table_rows_sorted = [r for r in table_rows if r["config"].startswith("No DP")]
+    table_rows_sorted += [r for r in table_rows if r["config"].startswith("Clipping only")]
+    table_rows_sorted += sorted(
+        [r for r in table_rows if r["config"].startswith("DP ")],
         key=lambda x: float(x["epsilon"]),
         reverse=True,
     )
@@ -86,23 +108,33 @@ def generate_report(results_path: Path, output_path: Path) -> None:
     for r in table_rows_sorted:
         table_md += f"| **{r['config']}** | {r['epsilon']} | {r['delta']} | {r['noise_mult']} | {r['accuracy']} | {r['drop']} |\n"
 
-    # Per-round convergence summary
-    round_summary_md = "| Round | Baseline Acc | ε=20 Acc | ε=5 Acc | ε=1 Acc |\n"
-    round_summary_md += "| :---: | :---: | :---: | :---: | :---: |\n"
+    # Per-round convergence summary for every epsilon present in the CSV.
+    epsilon_values = sorted(dp_df["epsilon"].unique(), reverse=True)
+    round_headers = ["Round", "Baseline Acc", "Clipping-only Acc"]
+    round_headers.extend(f"ε={epsilon:g} Acc" for epsilon in epsilon_values)
+    round_summary_md = "| " + " | ".join(round_headers) + " |\n"
+    round_summary_md += "| " + " | ".join([":---:"] * len(round_headers)) + " |\n"
     for r_num in sorted(df["round"].unique()):
         sub = df[df["round"] == r_num]
-        b_acc = sub[~sub["dp_enabled"] | sub["epsilon"].isna()]["test_accuracy"].mean() * 100.0 if not sub[~sub["dp_enabled"] | sub["epsilon"].isna()].empty else None
-        e20_acc = sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("20"))]["test_accuracy"].mean() * 100.0 if not sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("20"))].empty else None
-        e5_acc = sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("5"))]["test_accuracy"].mean() * 100.0 if not sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("5"))].empty else None
-        e1_acc = sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("1"))]["test_accuracy"].mean() * 100.0 if not sub[sub["dp_enabled"] & (sub["epsilon"].astype(str).str.startswith("1"))].empty else None
-
-        round_summary_md += (
-            f"| {r_num} | "
-            f"{f'{b_acc:.2f}%' if b_acc is not None else 'N/A'} | "
-            f"{f'{e20_acc:.2f}%' if e20_acc is not None else 'N/A'} | "
-            f"{f'{e5_acc:.2f}%' if e5_acc is not None else 'N/A'} | "
-            f"{f'{e1_acc:.2f}%' if e1_acc is not None else 'N/A'} |\n"
-        )
+        sub_clipping = sub.get(
+            "clipping_only", pd.Series(False, index=sub.index)
+        ).astype(bool)
+        sub_baseline = sub[~sub["dp_enabled"] & ~sub_clipping]
+        sub_clip = sub[sub_clipping]
+        row_values = [
+            str(r_num),
+            f"{sub_baseline['test_accuracy'].mean() * 100:.2f}%" if not sub_baseline.empty else "N/A",
+            f"{sub_clip['test_accuracy'].mean() * 100:.2f}%" if not sub_clip.empty else "N/A",
+        ]
+        for epsilon in epsilon_values:
+            sub_epsilon = sub[
+                sub["dp_enabled"] & (sub["epsilon"].astype(float) == epsilon)
+            ]
+            row_values.append(
+                f"{sub_epsilon['test_accuracy'].mean() * 100:.2f}%"
+                if not sub_epsilon.empty else "N/A"
+            )
+        round_summary_md += "| " + " | ".join(row_values) + " |\n"
 
     # General configuration values from CSV
     sample_row = df.iloc[0]
@@ -117,11 +149,25 @@ def generate_report(results_path: Path, output_path: Path) -> None:
     else:
         max_grad_norm = 1.0
     seeds_tested = ", ".join(map(str, sorted(df["seed"].unique())))
+    epsilon_text = ", ".join(f"{epsilon:g}" for epsilon in epsilon_values)
+    artifact_root = results_path.resolve().parent.parent
+    artifact_path = os.path.relpath(
+        artifact_root, start=output_path.resolve().parent
+    ).replace("\\", "/")
+    plot_paths = {
+        name: f"{artifact_path}/plots/{name}.png"
+        for name in (
+            "plot1_accuracy_vs_round",
+            "plot2_accuracy_vs_epsilon",
+            "plot3_accuracy_degradation",
+            "plot4_client_distribution",
+        )
+    }
 
     report_content = f"""# Experiment Report: Differential Privacy in Federated Fleet Learning
 
 **Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  
-**Artifacts Location:** `results/`  
+**Artifacts Location:** `{artifact_path}/`  
 **Seeds Evaluated:** [{seeds_tested}]
 
 ---
@@ -130,7 +176,7 @@ def generate_report(results_path: Path, output_path: Path) -> None:
 
 > **“Does adding differential privacy to a decentralized/federated optimizer still allow it to train, and what is the accuracy cost?”**
 
-In decentralized settings such as connected vehicular fleets, multiple nodes collaborate to learn a global predictive model without transmitting raw local sensor or perception data. However, gradient updates can leak private information about local training records. This experiment investigates whether injecting client-side differential privacy (via DP-SGD using Opacus) preserves global model convergence under heterogeneous fleet distributions, and measures the empirical degradation in accuracy across varying privacy budgets $\\varepsilon \\in \\{{1, 5, 20\\}}$.
+In decentralized settings such as connected vehicular fleets, multiple nodes collaborate to learn a global predictive model without transmitting raw local sensor or perception data. However, gradient updates can leak private information about local training records. This experiment investigates whether injecting client-side differential privacy (via DP-SGD using Opacus) preserves global model convergence under heterogeneous fleet distributions, and measures accuracy across target privacy budgets $\\varepsilon \\in \\{{{epsilon_text}\\}}$. A clipping-only control isolates clipping effects from noise effects.
 
 ---
 
@@ -152,7 +198,7 @@ The testbed is constructed using modern open-source federated learning and diffe
   * Learning rate (SGD): {lr}
   * Clipping norm ($C$): {max_grad_norm}
   * Target delta ($\\delta$): $10^{{-5}}$
-  * Privacy budgets tested: No DP (Baseline), $\\varepsilon = 20$ (relaxed), $\\varepsilon = 5$ (moderate), $\\varepsilon = 1$ (strong).
+* Privacy budgets tested: $\\varepsilon \\in \\{{{epsilon_text}\\}}$, plus a no-DP baseline and a clipping-only, zero-noise control.
 
 ---
 
@@ -162,13 +208,13 @@ In this research prototype, each simulated client corresponds to an autonomous v
 * **Heterogeneous Partitions:** Vehicles operating in different geographical regions or environmental operational domains encounter distinct categorical event frequencies. The non-IID Dirichlet distribution with $\\alpha = 0.3$ models this realistic skew (e.g., Vehicle 1 encountering primarily digits 0, 1, and 2, whereas Vehicle 3 observes mostly digits 5 and 6).
 * **Controlled Benchmark:** As established in the methodology, **MNIST is strictly used as a controlled benchmark dataset** to guarantee computational tractability and reproducible debugging. It acts as an experimental proxy for uneven local class distributions rather than a substitute for high-dimensional vehicle sensor streams.
 
-![Fleet Heterogeneity Heatmap](../results/plots/plot4_client_distribution.png)
+![Fleet Heterogeneity Heatmap]({plot_paths['plot4_client_distribution']})
 
 ---
 
 ## 4. Empirical Results
 
-All results presented below are derived from physical experiment runs executed across random seeds ({seeds_tested}).
+All results presented below are derived from simulated experiment runs executed across random seeds ({seeds_tested}).
 
 ### 4.1 Final Model Performance vs. Privacy Budget
 
@@ -182,25 +228,21 @@ All results presented below are derived from physical experiment runs executed a
 
 | Convergence Trajectory | Accuracy vs. Privacy Budget |
 | :---: | :---: |
-| ![Plot 1: Accuracy vs Round](../results/plots/plot1_accuracy_vs_round.png) | ![Plot 2: Accuracy vs Epsilon](../results/plots/plot2_accuracy_vs_epsilon.png) |
+| ![Plot 1: Accuracy vs Round]({plot_paths['plot1_accuracy_vs_round']}) | ![Plot 2: Accuracy vs Epsilon]({plot_paths['plot2_accuracy_vs_epsilon']}) |
 
 | Accuracy Degradation (Privacy Penalty) | Fleet Data Heterogeneity |
 | :---: | :---: |
-| ![Plot 3: Degradation](../results/plots/plot3_accuracy_degradation.png) | ![Plot 4: Distribution](../results/plots/plot4_client_distribution.png) |
+| ![Plot 3: Degradation]({plot_paths['plot3_accuracy_degradation']}) | ![Plot 4: Distribution]({plot_paths['plot4_client_distribution']}) |
 
 ---
 
 ## 5. Scientific Interpretation
 
-1. **Convergence Feasibility:** 
-   Across all tested privacy budgets $\\varepsilon \\in \\{{1, 5, 20\\}}$, the federated model consistently achieved stable convergence. Even under strict privacy guarantees ($\\varepsilon = 1.0$), the model progressively improved its evaluation accuracy over rounds, demonstrating that local per-sample gradient clipping and calibrated Gaussian perturbation do not prevent global gradient coordination.
+1. **Convergence Feasibility:**
+    The table and trajectories above summarize observed convergence for each tested privacy budget $\\varepsilon \\in \\{{{epsilon_text}\\}}$. Conclusions about stability should be drawn from these measured runs rather than assumed from the target epsilon alone.
 
 2. **Privacy vs. Utility Trade-off:**
-   A monotonic trend is observed between privacy strength and test accuracy:
-   * **No DP Baseline:** Achieved the highest global accuracy ({base_mean:.2f}%), unimpeded by gradient distortion.
-   * **Relaxed Privacy ($\\varepsilon = 20$):** Incurred minimal degradation, retaining close to baseline utility while bounding per-sample influence.
-   * **Moderate Privacy ($\\varepsilon = 5$):** Maintained strong classification performance with a moderate accuracy drop.
-   * **Strong Privacy ($\\varepsilon = 1$):** Produced the largest degradation due to higher noise variance and aggressive gradient truncation needed to satisfy tight Rényi Differential Privacy (RDP) accounting.
+    Compare the measured mean and standard deviation across the no-DP baseline, clipping-only control, and each DP budget above. The clipping-only gap estimates the effect of clipping; the additional gap between clipping-only and DP-SGD includes noise and privacy-accounting effects.
 
 3. **Fleet Heterogeneity Interactions:**
    Under Dirichlet $\\alpha = 0.3$, clients compute updates from non-uniform distributions. When combined with per-sample clipping, minority class gradients on specific vehicles risk disproportionate attenuation before noise addition. Despite this challenge, FedAvg effectively aggregated updates to construct a balanced global model.
@@ -227,7 +269,7 @@ To maintain scientific honesty, the following constraints of this research proto
 """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(report_content)
 
     print(f"Generated experiment report: {output_path}")

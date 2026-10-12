@@ -31,6 +31,7 @@ A complete, reproducible research prototype investigating the feasibility, conve
 In connected vehicle networks and IoT fleets, nodes collect diverse real-world telemetry and sensory inputs. Sending raw data to a central cloud server introduces severe privacy, compliance, and bandwidth risks. While Federated Learning (FL) avoids raw data transmission by keeping training local, shared gradient updates can still inadvertently reveal sensitive individual samples through reconstruction attacks.
 
 This project experimentally measures:
+
 1. Whether federated training with client-side differential privacy (DP-SGD via Opacus) still converges to a competitive model.
 2. The empirical accuracy trade-off across varying privacy budgets $\varepsilon \in \{1, 5, 20\}$ compared against a non-private baseline.
 
@@ -39,6 +40,7 @@ This project experimentally measures:
 ## Why Fleet Vehicles?
 
 Connected vehicles (autonomous or semi-autonomous fleets) represent a natural federated learning domain:
+
 * **Decentralized Data:** Each vehicle captures hundreds of gigabytes of localized perception, road-condition, and driver-behavior data daily.
 * **Non-IID Skew:** Different vehicles operate under wildly varying operational domains (urban rush-hour traffic vs. rural highways, varied weather conditions, differing geographic regions). This produces natural heterogeneity across client datasets.
 * **Privacy Sensitivity:** Vehicle locations, routes, and video snapshots contain sensitive personally identifiable information (PII) of drivers and pedestrians.
@@ -61,6 +63,7 @@ Connected vehicles (autonomous or semi-autonomous fleets) represent a natural fe
 ## Installation
 
 ### Prerequisites
+
 * Python $\ge 3.10$
 * Linux / macOS / Windows with Bash
 
@@ -98,11 +101,13 @@ python scripts/run_baseline.py
 ```
 
 Optional CLI overrides:
+
 ```bash
 python scripts/run_baseline.py --rounds 20 --clients 8 --alpha 0.3 --seed 42
 ```
 
 Expected behavior:
+
 ```text
 Round 1/20  -> Accuracy: ~67%
 Round 5/20  -> Accuracy: ~92%
@@ -127,6 +132,7 @@ python scripts/run_dp_experiment.py --epsilon 20.0
 ```
 
 Custom parameters:
+
 ```bash
 python scripts/run_dp_experiment.py --epsilon 5.0 --clients 8 --rounds 20 --delta 1e-5 --seed 42
 ```
@@ -138,15 +144,34 @@ python scripts/run_dp_experiment.py --epsilon 5.0 --clients 8 --rounds 20 --delt
 To execute the entire multi-condition, multi-seed evaluation matrix:
 
 ```bash
-python scripts/run_all_experiments.py --rounds 10 --seeds 42 43 44
+python scripts/run_all_experiments.py
 ```
 
-This automatically:
-1. Executes the No-DP baseline across all seeds.
-2. Executes DP experiments for $\varepsilon \in \{20, 5, 1\}$ across all seeds.
-3. Records all per-round and final metrics to `results/processed/experiment_results.csv`.
-4. Generates publication-ready plots in `results/plots/`.
-5. Compiles an empirical experiment report in `reports/experiment_report.md`.
+The default robust sweep uses 50 federated rounds, 3 local epochs per round,
+learning rate 0.05, clipping norm 0.5, five seeds (42-46), and target
+$\\varepsilon \\in \\{0.1, 0.5, 1, 5, 20, 100\\}$. It also runs a standard
+no-DP baseline and a clipping-only control (Opacus clipping with zero added
+noise). To override the sweep:
+
+```bash
+python scripts/run_all_experiments.py --epsilons 0.1 0.5 1 5 20 100 \
+    --seeds 42 43 44 45 46 --rounds 50 --local-epochs 3 \
+    --learning-rate 0.05 --max-grad-norm 0.5
+```
+
+Use `--skip-clipping-only` to omit the clipping control. The results CSV
+includes cumulative per-client epsilon, the actual noise multiplier,
+train accuracy, mean clipped-gradient norm, injected-noise norm, and
+per-sample pre/post-clipping norms. The generated report and plots summarize
+the five-seed mean and standard deviation.
+
+The runner automatically:
+
+1. Executes the no-DP baseline and clipping-only control across all seeds.
+2. Calibrates one noise multiplier for each requested epsilon over the full
+     configured run and executes the DP-SGD runs across all seeds.
+3. Records per-round metrics to `results/processed/experiment_results.csv`.
+4. Generates plots in `results/plots/` and the report in `reports/`.
 
 ---
 
@@ -159,6 +184,7 @@ python scripts/plot_results.py
 ```
 
 Generated plots:
+
 * **Plot 1: `results/plots/plot1_accuracy_vs_round.png`** — Global test accuracy vs. federated round across privacy budgets (convergence trajectories).
 * **Plot 2: `results/plots/plot2_accuracy_vs_epsilon.png`** — Final global test accuracy vs. privacy budget $\varepsilon$ (log-scale tradeoff curve).
 * **Plot 3: `results/plots/plot3_accuracy_degradation.png`** — Accuracy penalty (percentage points drop from baseline) vs. $\varepsilon$.
@@ -168,12 +194,12 @@ Generated plots:
 
 Physical runs across random seeds ($n=2$, seeds 42 & 43) produced the following benchmark results:
 
-| Configuration | Epsilon ($\varepsilon$) | Delta ($\delta$) | Mean Test Accuracy | Accuracy Penalty vs. Baseline |
-| :--- | :---: | :---: | :---: | :---: |
-| **No DP (Baseline)** | N/A | N/A | **90.97 ± 1.13%** | 0.00% (Reference) |
-| **DP ($\varepsilon = 20.0$)** | 20.0 | $10^{-5}$ | **49.56 ± 4.21%** | -41.41% |
-| **DP ($\varepsilon = 5.0$)** | 5.0 | $10^{-5}$ | **50.77 ± 3.66%** | -40.20% |
-| **DP ($\varepsilon = 1.0$)** | 1.0 | $10^{-5}$ | **49.99 ± 3.78%** | -40.98% |
+| Configuration                         | Epsilon ($\varepsilon$) | Delta ($\delta$) | Mean Test Accuracy | Accuracy Penalty vs. Baseline |                  |
+| :------------------------------------ | :--------------------------------------------: | :----------------: | :---------------------------: | :---------------: |
+| **No DP (Baseline)**            |                      N/A                      |        N/A        |   **90.97 ± 1.13%**   | 0.00% (Reference) |
+| **DP ($\varepsilon = 20.0$)** |                      20.0                      |    $10^{-5}$    |   **49.56 ± 4.21%**   |      -41.41%      |
+| **DP ($\varepsilon = 5.0$)**  |                      5.0                      |    $10^{-5}$    |   **50.77 ± 3.66%**   |      -40.20%      |
+| **DP ($\varepsilon = 1.0$)**  |                      1.0                      |    $10^{-5}$    |   **49.99 ± 3.78%**   |      -40.98%      |
 
 A complete analysis including convergence trajectories, domain grounding for vehicular fleets, and future extensions is documented in [`reports/experiment_report.md`](file:///home/storm/PHD_projects/federated-dp-fleet/reports/experiment_report.md).
 
@@ -182,15 +208,19 @@ A complete analysis including convergence trajectories, domain grounding for veh
 ## Privacy Mechanism
 
 ### Where is DP Applied?
+
 This experiment applies **client-side local DP-SGD during local node training**:
 
-$$\tilde{g}_t = \frac{1}{|B_t|} \sum_{i \in B_t} \left( \frac{g_i}{\max(1, \|g_i\|_2 / C)} + \mathcal{N}(0, \sigma^2 C^2 \mathbf{I}) \right)$$
+$$
+\tilde{g}_t = \frac{1}{|B_t|} \sum_{i \in B_t} \left( \frac{g_i}{\max(1, \|g_i\|_2 / C)} + \mathcal{N}(0, \sigma^2 C^2 \mathbf{I}) \right)
+$$
 
 1. **Per-sample gradient clipping:** Each sample's gradient $g_i$ is clipped to maximum $\ell_2$ norm $C$ ($C = 1.0$).
 2. **Gaussian noise injection:** Calibrated noise $\sigma = \text{noise\_multiplier}$ is added to bounded sums.
 3. **Privacy Accounting:** RDP (Rényi Differential Privacy) accountant calculates accumulated $(\varepsilon, \delta)$ spent based on batch sampling rate $q = \frac{|B|}{N}$, epochs, and noise multiplier.
 
 ### Privacy Scope & Honest Distinctions
+
 * **Provided:** Record-level differential privacy for local vehicle data. Individual samples cannot be easily reconstructed from client updates.
 * **Not Provided:** Client-level DP (does not mask whether a vehicle participated in a round), secure aggregation (updates are unencrypted in transit to the server), or Byzantine fault tolerance.
 
@@ -200,7 +230,9 @@ $$\tilde{g}_t = \frac{1}{|B_t|} \sum_{i \in B_t} \left( \frac{g_i}{\max(1, \|g_i
 
 To simulate fleet conditions, local vehicle data is partitioned using a Dirichlet distribution:
 
-$$p_k \sim \text{Dirichlet}(\alpha)$$
+$$
+p_k \sim \text{Dirichlet}(\alpha)
+$$
 
 * Default concentration: $\alpha = 0.3$.
 * Lower $\alpha$ induces extreme class imbalance (e.g., Vehicle 1 observes almost exclusively digits 0 and 1; Vehicle 4 observes digits 6 and 7).
@@ -264,6 +296,7 @@ federated-dp-fleet/
 ## Reproducibility
 
 Every run fixes random seeds across Python `random`, `numpy`, and PyTorch:
+
 * Partition seed: Ensures identical data assignment to simulated vehicles.
 * Weight initialization seed: Guarantees equivalent initial global parameters.
 * Multi-seed evaluation (`--seeds 42 43 44`): Computes rigorous empirical $\text{mean} \pm \text{std}$.

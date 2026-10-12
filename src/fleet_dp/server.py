@@ -31,6 +31,7 @@ from fleet_dp.data import (
     get_test_loader,
     load_dataset,
 )
+from fleet_dp.dp import calibrate_noise_multiplier
 from fleet_dp.metrics import MetricsCollector, RoundMetrics
 from fleet_dp.model import create_model
 from fleet_dp.utils import get_device, set_seed
@@ -46,6 +47,7 @@ def get_evaluate_fn(
     collector: MetricsCollector,
     experiment_name: str,
     seed: int,
+    round_fit_metrics: Optional[dict[int, dict[str, float]]] = None,
 ) -> Callable:
     """Create a server-side evaluation function.
 
@@ -99,13 +101,16 @@ def get_evaluate_fn(
         elapsed = time.time() - start_time
 
         # Record metrics
+        fit_metrics = (round_fit_metrics or {}).get(server_round, {})
         metrics = RoundMetrics(
             experiment=experiment_name,
             epsilon=config.dp.target_epsilon if config.dp.enabled else None,
             delta=config.dp.target_delta if config.dp.enabled else None,
             seed=seed,
             round_num=server_round,
-            train_loss=avg_loss,
+            train_loss=fit_metrics.get("train_loss", 0.0),
+            train_accuracy=fit_metrics.get("train_accuracy", 0.0),
+            test_loss=avg_loss,
             test_accuracy=accuracy,
             num_clients=config.dataset.num_clients,
             local_epochs=config.federated.local_epochs,
@@ -116,8 +121,18 @@ def get_evaluate_fn(
             ),
             noise_multiplier=config.dp.noise_multiplier,
             num_samples=total,
+            current_epsilon=config.dp.current_epsilon,
+            clipped_grad_norm=fit_metrics.get("clipped_grad_norm"),
+            noise_norm=fit_metrics.get("noise_norm"),
+            preclip_sample_grad_norm=fit_metrics.get(
+                "preclip_sample_grad_norm"
+            ),
+            clipped_sample_grad_norm=fit_metrics.get(
+                "clipped_sample_grad_norm"
+            ),
             elapsed_time=elapsed,
             dp_enabled=config.dp.enabled,
+            clipping_only=config.dp.clipping_only,
         )
         collector.log_round(metrics)
 
@@ -137,8 +152,17 @@ def get_evaluate_fn(
     return evaluate
 
 
-def get_fit_metrics_aggregation_fn() -> Callable:
-    """Create a function to aggregate training metrics from clients."""
+def get_fit_metrics_aggregation_fn(
+    config: Optional[ExperimentConfig] = None,
+    round_fit_metrics: Optional[dict[int, dict[str, float]]] = None,
+) -> Callable:
+    """Create a function to aggregate training metrics from clients.
+
+    When ``config`` is provided, calibrated DP values reported by clients
+    are written back onto the experiment config so evaluation logging and
+    ``experiment_results.csv`` record the actual noise multiplier and
+    privacy spent (not the pre-calibration ``None`` defaults).
+    """
 
     def aggregate_fit_metrics(
         metrics: list[tuple[int, dict[str, Any]]]
@@ -171,11 +195,39 @@ def get_fit_metrics_aggregation_fn() -> Callable:
             "train_loss": float(avg_loss),
             "train_accuracy": float(avg_acc),
         }
+        for name in (
+            "clipped_grad_norm",
+            "noise_norm",
+            "preclip_sample_grad_norm",
+            "clipped_sample_grad_norm",
+        ):
+            values = [
+                (n, m[name]) for n, m in metrics if name in m
+            ]
+            if values:
+                weight = sum(n for n, _ in values)
+                result[name] = float(
+                    sum(n * value for n, value in values) / weight
+                )
         if epsilons:
             result["max_epsilon_spent"] = float(max(epsilons))
             result["avg_epsilon_spent"] = float(np.mean(epsilons))
         if noise_mults:
-            result["noise_multiplier"] = float(noise_mults[0])
+            result["noise_multiplier"] = float(np.mean(noise_mults))
+
+        rounds = [m["server_round"] for _, m in metrics if "server_round" in m]
+        if rounds and round_fit_metrics is not None:
+            round_fit_metrics[int(rounds[0])] = {
+                key: float(value)
+                for key, value in result.items()
+                if isinstance(value, (int, float))
+            }
+
+        if config is not None:
+            config.record_calibrated_privacy(
+                noise_multiplier=result.get("noise_multiplier"),
+                current_epsilon=result.get("max_epsilon_spent"),
+            )
 
         return result
 
@@ -205,7 +257,9 @@ def run_federated_experiment(
     logger.info(f"Using device: {device}")
 
     # Determine experiment name
-    if config.dp.enabled and config.dp.target_epsilon is not None:
+    if config.dp.clipping_only:
+        exp_name = f"clip_only_seed{seed}"
+    elif config.dp.enabled and config.dp.target_epsilon is not None:
         exp_name = f"dp_eps{config.dp.target_epsilon}_seed{seed}"
     else:
         exp_name = f"baseline_seed{seed}"
@@ -232,6 +286,40 @@ def run_federated_experiment(
         seed=seed,
     )
 
+    # Calibrate noise on the server so CSV rows are not empty even if
+    # client metrics are not echoed back through Flower/Ray.
+    if (
+        config.dp.enabled
+        and config.dp.target_epsilon is not None
+        and config.dp.noise_multiplier is None
+    ):
+        sizes = [
+            len(loader.dataset)
+            for loader in client_loaders
+            if getattr(loader, "dataset", None) is not None
+        ]
+        min_n = float(min(sizes)) if sizes else 1.0
+        sample_rate = min(1.0, config.federated.batch_size / max(min_n, 1.0))
+        config.dp.noise_multiplier = calibrate_noise_multiplier(
+            target_epsilon=config.dp.target_epsilon,
+            target_delta=config.dp.target_delta,
+            sample_rate=sample_rate,
+            epochs=(
+                config.federated.local_epochs
+                * config.federated.num_rounds
+            ),
+            max_grad_norm=config.dp.max_grad_norm,
+        )
+        logger.info(
+            f"Server-calibrated noise_multiplier="
+            f"{config.dp.noise_multiplier:.4f} "
+            f"(minimum client n={min_n:.0f}, sample_rate={sample_rate:.4f}, "
+            f"total local epochs={config.federated.local_epochs * config.federated.num_rounds})"
+        )
+
+    if config.dp.enabled and config.dp.current_epsilon is None:
+        config.dp.current_epsilon = 0.0
+
     # Create initial model and get parameters
     init_model = create_model(config.model.name).to(device)
     init_params = [
@@ -255,8 +343,11 @@ def run_federated_experiment(
             target_delta=config.dp.target_delta,
             max_grad_norm=config.dp.max_grad_norm,
             noise_multiplier=config.dp.noise_multiplier,
+            clipping_only=config.dp.clipping_only,
         )
         return client.to_client()
+
+    round_fit_metrics: dict[int, dict[str, float]] = {}
 
     # Strategy: FedAvg
     strategy = FedAvg(
@@ -273,9 +364,13 @@ def run_federated_experiment(
             collector=collector,
             experiment_name=exp_name,
             seed=seed,
+            round_fit_metrics=round_fit_metrics,
         ),
         initial_parameters=flwr.common.ndarrays_to_parameters(init_params),
-        fit_metrics_aggregation_fn=get_fit_metrics_aggregation_fn(),
+        fit_metrics_aggregation_fn=get_fit_metrics_aggregation_fn(
+            config, round_fit_metrics
+        ),
+        on_fit_config_fn=lambda server_round: {"server_round": server_round},
     )
 
     # Run simulation
@@ -284,13 +379,49 @@ def run_federated_experiment(
         f"clients for {config.federated.num_rounds} rounds..."
     )
 
-    start_simulation(
+    history = start_simulation(
         client_fn=client_fn,
         num_clients=config.dataset.num_clients,
         config=ServerConfig(num_rounds=config.federated.num_rounds),
         strategy=strategy,
         ray_init_args={"num_cpus": 2, "include_dashboard": False},
     )
+
+    nm_by_round: dict[int, float] = {}
+    eps_by_round: dict[int, float] = {}
+    if history is not None:
+        nm_by_round = {
+            int(rnd): float(val)
+            for rnd, val in history.metrics_distributed_fit.get(
+                "noise_multiplier", []
+            )
+        }
+        eps_by_round = {
+            int(rnd): float(val)
+            for rnd, val in history.metrics_distributed_fit.get(
+                "max_epsilon_spent", []
+            )
+        }
+        if nm_by_round and config.dp.noise_multiplier is None:
+            config.dp.noise_multiplier = next(iter(nm_by_round.values()))
+        if eps_by_round:
+            config.dp.current_epsilon = eps_by_round[max(eps_by_round)]
+
+    # Backfill calibrated DP values if evaluate ran before fit metrics
+    # were available (Flower evaluates round 0 before any client fit).
+    if config.dp.enabled:
+        for metrics in collector.rounds:
+            if metrics.round_num in nm_by_round:
+                metrics.noise_multiplier = nm_by_round[metrics.round_num]
+            elif metrics.noise_multiplier is None:
+                metrics.noise_multiplier = config.dp.noise_multiplier
+            if metrics.round_num in eps_by_round:
+                metrics.current_epsilon = eps_by_round[metrics.round_num]
+            elif metrics.round_num > 0 and metrics.current_epsilon is None:
+                metrics.current_epsilon = config.dp.current_epsilon
+    elif config.dp.clipping_only:
+        for metrics in collector.rounds:
+            metrics.noise_multiplier = 0.0
 
     # Save results
     collector.save_raw(exp_name)

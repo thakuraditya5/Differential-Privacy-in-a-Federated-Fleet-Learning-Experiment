@@ -44,10 +44,12 @@ class FederatedConfig:
 class DPConfig:
     """Differential privacy configuration."""
     enabled: bool = False
+    clipping_only: bool = False
     target_epsilon: Optional[float] = None
     target_delta: float = 1e-5
     max_grad_norm: float = 1.0
     noise_multiplier: Optional[float] = None  # Set by calibration if needed
+    current_epsilon: Optional[float] = None  # Privacy spent, reported by clients
 
 
 @dataclass
@@ -117,13 +119,31 @@ class ExperimentConfig:
             dp = d["dp"]
             cfg.dp = DPConfig(
                 enabled=dp.get("enabled", False),
+                clipping_only=dp.get("clipping_only", False),
                 target_epsilon=dp.get("target_epsilon"),
                 target_delta=dp.get("target_delta", 1e-5),
                 max_grad_norm=dp.get("max_grad_norm", 1.0),
                 noise_multiplier=dp.get("noise_multiplier"),
+                current_epsilon=dp.get("current_epsilon"),
             )
 
         return cfg
+
+    def record_calibrated_privacy(
+        self,
+        noise_multiplier: Optional[float] = None,
+        current_epsilon: Optional[float] = None,
+    ) -> None:
+        """Store runtime DP values reported by clients after calibration.
+
+        Opacus calibrates ``noise_multiplier`` on each client. The server
+        records the aggregated values so evaluate-time metrics and the
+        saved config include the actual privacy parameters used.
+        """
+        if noise_multiplier is not None:
+            self.dp.noise_multiplier = float(noise_multiplier)
+        if current_epsilon is not None:
+            self.dp.current_epsilon = float(current_epsilon)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config to a dictionary."""
@@ -150,10 +170,12 @@ class ExperimentConfig:
             },
             "dp": {
                 "enabled": self.dp.enabled,
+                "clipping_only": self.dp.clipping_only,
                 "target_epsilon": self.dp.target_epsilon,
                 "target_delta": self.dp.target_delta,
                 "max_grad_norm": self.dp.max_grad_norm,
                 "noise_multiplier": self.dp.noise_multiplier,
+                "current_epsilon": self.dp.current_epsilon,
             },
         }
 
